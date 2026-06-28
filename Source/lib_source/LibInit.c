@@ -1,6 +1,7 @@
 /*
- * SPDX-License-Identifier: BSD-2-Clause
- * Copyright 2026 amigazen project
+ * Copyright (C) 1995-2017 Jean-loup Gailly and Mark Adler
+ * For conditions of distribution and use, see copyright notice in zlib.h
+ * Amiga z.library integration by amigazen project
  *
  * LibInit.c - ROMTag, DataTab, and pooled allocator init for z.library
  */

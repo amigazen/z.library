@@ -1,0 +1,154 @@
+#
+# Source/lib_source/smakefile - z.library and static zlib.lib
+#
+# Targets:
+#   smake          -> z.library (shared, full zlib + LVO functable)
+#   smake static   -> zlib.lib  (static core deflate/inflate only, Z_SOLO)
+#   smake stubs    -> zlibstubs.lib (autoinit + zlib-name stubs -> LVOs)
+#
+# Note: SAS/C names object files with OBJNAME= (not slink's TO).
+
+CC      = sc
+LD      = slink
+OML     = oml
+RM      = delete force quiet
+
+TARGET  = z.library
+STATIC  = zlib.lib
+STUBS   = zlibstubs.lib
+BUILD_H = private/z_build.h
+
+ZINCL   = idir=zlib DEF=AMIGA
+ZSOLO   = idir=zlib DEF=AMIGA DEF=Z_SOLO
+
+LIB_OBJS = StartUp.o LibInit.o malloc.o z_lvo.o \
+           zlib/adler32.o zlib/crc32.o zlib/compress.o zlib/uncompr.o \
+           zlib/deflate.o zlib/inflate.o zlib/infback.o \
+           zlib/inftrees.o zlib/inffast.o zlib/trees.o zlib/zutil.o
+
+STATIC_OBJS = adler32_s.o crc32_s.o deflate_s.o inflate_s.o \
+              inftrees_s.o inffast_s.o trees_s.o zutil_s.o
+
+STUB_OBJS = static/autoinit_z_base.o static/z_stubs.o
+
+all: $(TARGET)
+
+static: $(STATIC)
+
+stubs: $(STUBS)
+
+rebuild: clean all
+
+$(TARGET): $(LIB_OBJS) smakefile.wth $(BUILD_H)
+	$(LD) WITH smakefile.wth WITH LIB:utillib.with
+
+$(STATIC): $(STATIC_OBJS)
+	$(OML) $(STATIC) r $(STATIC_OBJS)
+
+$(STUBS): $(STUB_OBJS)
+	$(OML) $(STUBS) r $(STUB_OBJS)
+
+StartUp.o: StartUp.c $(BUILD_H) z_funcs.h compiler.h
+	$(CC) StartUp.c
+
+LibInit.o: LibInit.c $(BUILD_H) compiler.h zlib/zlib.h
+	$(CC) $(ZINCL) LibInit.c
+
+malloc.o: malloc.c
+	$(CC) malloc.c
+
+z_lvo.o: z_lvo.c z_funcs.h compiler.h zlib/zlib.h
+	$(CC) $(ZINCL) z_lvo.c
+
+zlib/adler32.o: zlib/adler32.c zlib/zlib.h zlib/zconf.h
+	$(CC) $(ZINCL) zlib/adler32.c OBJNAME=zlib/adler32.o
+
+zlib/crc32.o: zlib/crc32.c zlib/zlib.h zlib/zconf.h zlib/crc32.h
+	$(CC) $(ZINCL) zlib/crc32.c OBJNAME=zlib/crc32.o
+
+zlib/compress.o: zlib/compress.c zlib/zlib.h zlib/zconf.h
+	$(CC) $(ZINCL) zlib/compress.c OBJNAME=zlib/compress.o
+
+zlib/uncompr.o: zlib/uncompr.c zlib/zlib.h zlib/zconf.h
+	$(CC) $(ZINCL) zlib/uncompr.c OBJNAME=zlib/uncompr.o
+
+zlib/deflate.o: zlib/deflate.c zlib/zlib.h zlib/zconf.h zlib/deflate.h
+	$(CC) $(ZINCL) zlib/deflate.c OBJNAME=zlib/deflate.o
+
+zlib/inflate.o: zlib/inflate.c zlib/zlib.h zlib/zconf.h zlib/inflate.h
+	$(CC) $(ZINCL) zlib/inflate.c OBJNAME=zlib/inflate.o
+
+zlib/infback.o: zlib/infback.c zlib/zlib.h zlib/zconf.h zlib/inflate.h
+	$(CC) $(ZINCL) zlib/infback.c OBJNAME=zlib/infback.o
+
+zlib/inftrees.o: zlib/inftrees.c zlib/zlib.h zlib/zconf.h zlib/inftrees.h
+	$(CC) $(ZINCL) zlib/inftrees.c OBJNAME=zlib/inftrees.o
+
+zlib/inffast.o: zlib/inffast.c zlib/zlib.h zlib/zconf.h zlib/inffast.h
+	$(CC) $(ZINCL) zlib/inffast.c OBJNAME=zlib/inffast.o
+
+zlib/trees.o: zlib/trees.c zlib/zlib.h zlib/zconf.h zlib/trees.h
+	$(CC) $(ZINCL) zlib/trees.c OBJNAME=zlib/trees.o
+
+zlib/zutil.o: zlib/zutil.c zlib/zlib.h zlib/zconf.h zlib/zutil.h
+	$(CC) $(ZINCL) zlib/zutil.c OBJNAME=zlib/zutil.o
+
+adler32_s.o: zlib/adler32.c zlib/zlib.h zlib/zconf.h
+	$(CC) $(ZSOLO) zlib/adler32.c OBJNAME=adler32_s.o
+
+crc32_s.o: zlib/crc32.c zlib/zlib.h zlib/zconf.h zlib/crc32.h
+	$(CC) $(ZSOLO) zlib/crc32.c OBJNAME=crc32_s.o
+
+deflate_s.o: zlib/deflate.c zlib/zlib.h zlib/zconf.h zlib/deflate.h
+	$(CC) $(ZSOLO) zlib/deflate.c OBJNAME=deflate_s.o
+
+inflate_s.o: zlib/inflate.c zlib/zlib.h zlib/zconf.h zlib/inflate.h
+	$(CC) $(ZSOLO) zlib/inflate.c OBJNAME=inflate_s.o
+
+inftrees_s.o: zlib/inftrees.c zlib/zlib.h zlib/zconf.h zlib/inftrees.h
+	$(CC) $(ZSOLO) zlib/inftrees.c OBJNAME=inftrees_s.o
+
+inffast_s.o: zlib/inffast.c zlib/zlib.h zlib/zconf.h zlib/inffast.h
+	$(CC) $(ZSOLO) zlib/inffast.c OBJNAME=inffast_s.o
+
+trees_s.o: zlib/trees.c zlib/zlib.h zlib/zconf.h zlib/trees.h
+	$(CC) $(ZSOLO) zlib/trees.c OBJNAME=trees_s.o
+
+zutil_s.o: zlib/zutil.c zlib/zlib.h zlib/zconf.h zlib/zutil.h
+	$(CC) $(ZSOLO) zlib/zutil.c OBJNAME=zutil_s.o
+
+static/autoinit_z_base.o: static/autoinit_z_base.c
+	$(CC) static/autoinit_z_base.c OBJNAME=static/autoinit_z_base.o
+
+static/z_stubs.o: static/z_stubs.c zlib/zlib.h
+	$(CC) idir=zlib static/z_stubs.c OBJNAME=static/z_stubs.o
+
+release:
+	Copy $(TARGET) //SYS/Libs/$(TARGET)
+
+install:
+	Copy $(TARGET) LIBS:$(TARGET)
+	avail flush
+
+installstatic:
+	Copy $(STATIC) LIBS:$(STATIC)
+
+headers:
+	Copy clone /include/libraries/z.h //SDK/Include_h/libraries/z.h
+	Copy clone /include/z/zbase.h //SDK/Include_h/z/zbase.h
+	Copy clone /include/proto/z.h //SDK/Include_h/proto/z.h
+	Copy clone /include/clib/z_protos.h //SDK/Include_h/clib/z_protos.h
+	Copy clone /include/pragmas/z_pragmas.h //SDK/Include_h/pragmas/z_pragmas.h
+	Copy clone zlib/zlib.h //SDK/Include_h/zlib/zlib.h
+	Copy clone zlib/zconf.h //SDK/Include_h/zlib/zconf.h
+
+clean:
+	-$(RM) \#?.o
+	-$(RM) adler32_s.o crc32_s.o deflate_s.o inflate_s.o
+	-$(RM) inftrees_s.o inffast_s.o trees_s.o zutil_s.o
+	-$(RM) zlib/\#?.o
+	-$(RM) static/\#?.o
+	-$(RM) $(TARGET)
+	-$(RM) $(TARGET).info
+	-$(RM) $(STATIC)
+	-$(RM) $(STUBS)
