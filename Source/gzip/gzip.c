@@ -650,8 +650,8 @@ local void treat_stdin()
 	if (S_ISREG(istat.st_mode))
 # endif
 	    time_stamp = istat.st_mtime;
-#endif /* NO_STDIN_FSTAT */
     }
+#endif /* NO_STDIN_FSTAT */
     ifile_size = -1L; /* convention for unknown size */
 
     clear_bufs(); /* clear input and output buffers */
