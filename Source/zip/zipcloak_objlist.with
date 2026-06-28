@@ -1,0 +1,1 @@
+zipcloak.o globals.o zipfile.uo fileio.uo util.uo amigazip.uo amiga.o time_lib.o stat.o filedate.o crypt.uo crctab.o ttyio.o

@@ -1,0 +1,1 @@
+zip.lo zipfile.lo zipup.lo fileio.lo util.lo globals.lo crc32.lo crctab.lo crypt.lo ttyio.lo deflate.lo trees.lo amiga.lo amigazip.lo time_lib.o stat.o filedate.o
