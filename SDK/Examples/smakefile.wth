@@ -1,0 +1,5 @@
+FROM     sc:lib/c.o ZTest.o libbases.o
+LIB      LIB:sc.lib LIB:amiga.lib
+SC SD ND
+NODEBUG
+TO       ZTest
