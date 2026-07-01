@@ -10,4 +10,5 @@
 #include <exec/execbase.h>
 
 struct Library *ZBase;
+struct Library *LowLevelBase;
 extern struct ExecBase *SysBase;

@@ -9,19 +9,47 @@
  * Uses library-default zalloc (NULL); app-supplied allocators are not tested
  * here because SAS/C small-data callbacks across the library boundary are
  * unsupported in production (see amihttp ht_zlib.c).
+ *
+ *   ZTest -bench-only
+ *       Benchmark compress/uncompress, stream deflate/inflate, and checksums.
+ *       Uses lowlevel.library/ElapsedTime() (V40).  Library build profile is
+ *       printed from z.library IdString when available.
+ *
+ *   ZTest -bench-only 10
+ *       Ten iterations per benchmark (default 3).
+ *
+ *   ZTest -bench 5
+ *       Run full API tests, then benchmarks with five iterations each.
+ *
+ *   ZTest -stress-only
+ *       Deterministic roundtrip matrix, chunked stream I/O, negative cases,
+ *       and a soak loop with AvailMem leak check.
+ *
+ *   ZTest -stress-only 5
+ *       Repeat the roundtrip matrix five times (different PRNG stream each pass).
+ *
+ *   ZTest -stress-only -seed 12345
+ *       Reproducible pseudo-random payloads.
+ *
+ *   ZTest -stress
+ *       Run full API tests, then stress suite.
  */
 
 #include <exec/types.h>
 #include <exec/libraries.h>
 #include <exec/memory.h>
+#include <devices/timer.h>
 #include <dos/dos.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <libraries/z.h>
 #include <clib/compiler-specific.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
+#include <proto/lowlevel.h>
 #include <proto/z.h>
 
 extern struct Library *ZBase;
@@ -55,6 +83,560 @@ static const UBYTE zt_dict_src[] =
 
 static ULONG zt_pass;
 static ULONG zt_fail;
+static BOOL zt_bench_mode;
+static BOOL zt_bench_only;
+static ULONG zt_bench_iters;
+static BOOL zt_stress_mode;
+static BOOL zt_stress_only;
+static ULONG zt_stress_mult;
+static ULONG zt_stress_seed;
+static ULONG zt_stress_pass;
+static ULONG zt_stress_fail;
+static ULONG zt_rng;
+
+#define ZT_BENCH_4K   (4UL * 1024UL)
+#define ZT_BENCH_64K  (64UL * 1024UL)
+#define ZT_STRESS_SOAK_ITERS  1000UL
+#define ZT_STRESS_IN_CHUNK    137UL
+#define ZT_STRESS_ZLIB_WINDOW 15L
+
+/* lowlevel.library/ElapsedTime (V40) — see NDK Autodocs/lowlevel.doc */
+static struct EClockVal zt_et_ctx;
+
+static VOID zt_stream_clear(z_stream *strm);
+
+static VOID
+zt_stress_note(STRPTR name, BOOL ok, STRPTR detail)
+{
+    if (ok) {
+        zt_stress_pass++;
+    } else {
+        zt_stress_fail++;
+    }
+    Printf("ZStress: %s %s", ok ? (STRPTR)"PASS" : (STRPTR)"FAIL", name);
+    if (detail != NULL && detail[0] != '\0') {
+        Printf(" (%s)", detail);
+    }
+    Printf("\n");
+    Flush(Output());
+}
+
+static VOID
+zt_rng_seed(ULONG seed)
+{
+    if (seed == 0UL) {
+        seed = 0x5eed1234UL;
+    }
+    zt_rng = seed;
+}
+
+static UBYTE
+zt_rng_byte(VOID)
+{
+    zt_rng = (zt_rng * 1103515245UL) + 12345UL;
+    return (UBYTE)((zt_rng >> 16) & 0xFF);
+}
+
+static VOID
+zt_rng_fill(APTR buf, ULONG len)
+{
+    UBYTE *p;
+    ULONG i;
+
+    p = (UBYTE *)buf;
+    for (i = 0; i < len; i++) {
+        p[i] = zt_rng_byte();
+    }
+}
+
+static ULONG
+zt_stress_out_cap(ULONG plain_len, LONG windowBits)
+{
+    ULONG cap;
+
+    cap = plain_len + (plain_len >> 4) + 128UL;
+    if (windowBits > ZT_STRESS_ZLIB_WINDOW) {
+        cap += 32UL;
+    }
+    if (cap < 256UL) {
+        cap = 256UL;
+    }
+    return cap;
+}
+
+static BOOL
+zt_stress_deflate_all(CONST_APTR in, ULONG in_len, LONG level, LONG windowBits,
+    UBYTE *out, ULONG out_cap, ULONG *out_len, BOOL chunked)
+{
+    z_stream strm;
+    ULONG in_off;
+    ULONG in_chunk;
+    ULONG take;
+    LONG rc;
+    LONG flush;
+
+    /* Chunked mode feeds input in small slices; output uses the full buffer
+       (same pattern as zt_inflate_chunked in the smoke tests). */
+    in_chunk = chunked ? ZT_STRESS_IN_CHUNK : in_len;
+    in_off = 0;
+    *out_len = 0;
+
+    zt_stream_clear(&strm);
+    rc = DeflateInit2(&strm, level, Z_DEFLATED, windowBits, 8,
+        Z_DEFAULT_STRATEGY);
+    if (rc != Z_OK) {
+        return FALSE;
+    }
+
+    strm.next_out = out;
+    strm.avail_out = out_cap;
+    flush = Z_NO_FLUSH;
+
+    for (;;) {
+        if (strm.avail_in == 0 && in_off < in_len) {
+            take = in_len - in_off;
+            if (take > in_chunk) {
+                take = in_chunk;
+            }
+            strm.next_in = ((UBYTE *)in) + in_off;
+            strm.avail_in = take;
+            in_off += take;
+        }
+        if (in_off >= in_len && strm.avail_in == 0) {
+            flush = Z_FINISH;
+        }
+
+        rc = Deflate(&strm, flush);
+        if (rc == Z_STREAM_END) {
+            *out_len = out_cap - strm.avail_out;
+            DeflateEnd(&strm);
+            return TRUE;
+        }
+        if (rc != Z_OK) {
+            DeflateEnd(&strm);
+            return FALSE;
+        }
+        if (flush == Z_FINISH && strm.avail_out == 0) {
+            DeflateEnd(&strm);
+            return FALSE;
+        }
+    }
+}
+
+static BOOL
+zt_stress_inflate_all(CONST_APTR comp, ULONG comp_len, LONG windowBits,
+    UBYTE *out, ULONG out_cap, ULONG *out_len, BOOL chunked)
+{
+    z_stream strm;
+    ULONG in_off;
+    ULONG in_chunk;
+    ULONG take;
+    ULONG produced;
+    LONG rc;
+    LONG flush;
+
+    in_chunk = chunked ? ZT_STRESS_IN_CHUNK : comp_len;
+    in_off = 0;
+    *out_len = 0;
+
+    zt_stream_clear(&strm);
+    rc = InflateInit2(&strm, windowBits);
+    if (rc != Z_OK) {
+        return FALSE;
+    }
+
+    strm.next_out = out;
+    strm.avail_out = out_cap;
+    flush = Z_NO_FLUSH;
+
+    for (;;) {
+        if (strm.avail_in == 0 && in_off < comp_len) {
+            take = comp_len - in_off;
+            if (take > in_chunk) {
+                take = in_chunk;
+            }
+            strm.next_in = ((UBYTE *)comp) + in_off;
+            strm.avail_in = take;
+            in_off += take;
+        }
+        if (in_off >= comp_len && strm.avail_in == 0) {
+            flush = Z_FINISH;
+        }
+
+        rc = Inflate(&strm, flush);
+        produced = out_cap - strm.avail_out;
+
+        if (rc == Z_STREAM_END) {
+            *out_len = produced;
+            InflateEnd(&strm);
+            return TRUE;
+        }
+        if (rc != Z_OK) {
+            InflateEnd(&strm);
+            return FALSE;
+        }
+        if (flush == Z_FINISH && produced == out_cap) {
+            InflateEnd(&strm);
+            return FALSE;
+        }
+    }
+}
+
+static BOOL
+zt_stress_roundtrip_one(CONST_APTR plain, ULONG plain_len, LONG level,
+    LONG windowBits, BOOL chunked, STRPTR label)
+{
+    UBYTE *comp;
+    UBYTE *out;
+    ULONG comp_cap;
+    ULONG comp_len;
+    ULONG out_len;
+    ULONG adler_plain;
+    ULONG adler_out;
+    BOOL ok;
+
+    comp_cap = zt_stress_out_cap(plain_len, windowBits);
+    comp = (UBYTE *)AllocMem(comp_cap, MEMF_ANY);
+    out = (UBYTE *)AllocMem(plain_len > 0UL ? plain_len : 1UL, MEMF_ANY);
+    if (comp == NULL || out == NULL) {
+        FreeMem(comp, comp_cap);
+        FreeMem(out, plain_len > 0UL ? plain_len : 1UL);
+        zt_stress_note(label, FALSE, (STRPTR)"no mem");
+        return FALSE;
+    }
+
+    adler_plain = Adler32(Adler32(0, NULL, 0), plain, plain_len);
+    ok = zt_stress_deflate_all(plain, plain_len, level, windowBits,
+        comp, comp_cap, &comp_len, chunked);
+    if (!ok) {
+        FreeMem(comp, comp_cap);
+        FreeMem(out, plain_len > 0UL ? plain_len : 1UL);
+        zt_stress_note(label, FALSE, (STRPTR)"deflate");
+        return FALSE;
+    }
+
+    ok = zt_stress_inflate_all(comp, comp_len, windowBits,
+        out, plain_len > 0UL ? plain_len : 1UL, &out_len, chunked);
+    if (!ok || out_len != plain_len) {
+        FreeMem(comp, comp_cap);
+        FreeMem(out, plain_len > 0UL ? plain_len : 1UL);
+        zt_stress_note(label, FALSE, (STRPTR)"inflate len");
+        return FALSE;
+    }
+
+    if (plain_len > 0UL && memcmp(out, plain, plain_len) != 0) {
+        FreeMem(comp, comp_cap);
+        FreeMem(out, plain_len);
+        zt_stress_note(label, FALSE, (STRPTR)"data mismatch");
+        return FALSE;
+    }
+
+    adler_out = Adler32(Adler32(0, NULL, 0), out, out_len);
+    if (adler_plain != adler_out) {
+        FreeMem(comp, comp_cap);
+        FreeMem(out, plain_len > 0UL ? plain_len : 1UL);
+        zt_stress_note(label, FALSE, (STRPTR)"adler mismatch");
+        return FALSE;
+    }
+
+    FreeMem(comp, comp_cap);
+    FreeMem(out, plain_len > 0UL ? plain_len : 1UL);
+    zt_stress_note(label, TRUE, NULL);
+    return TRUE;
+}
+
+static VOID
+zt_stress_roundtrip_matrix(VOID)
+{
+    static const ULONG sizes[] = {
+        0UL, 1UL, 3UL, 127UL, 128UL, 255UL, 256UL,
+        4095UL, 4096UL, 65535UL, 65536UL
+    };
+    static const LONG levels[] = { 0L, 1L, 3L, 6L, 9L };
+    static const LONG windows[] = {
+        ZT_RAW_WINDOW, ZT_STRESS_ZLIB_WINDOW, ZT_GZIP_WINDOW
+    };
+    static const STRPTR wrap_names[] = {
+        (STRPTR)"raw", (STRPTR)"zlib", (STRPTR)"gzip"
+    };
+    UBYTE *plain;
+    ULONG pass_idx;
+    ULONG si;
+    ULONG li;
+    ULONG wi;
+    ULONG ci;
+    char label[96];
+
+    for (pass_idx = 0; pass_idx < zt_stress_mult; pass_idx++) {
+        zt_rng_seed(zt_stress_seed + pass_idx);
+
+        for (si = 0; si < (ULONG)(sizeof(sizes) / sizeof(sizes[0])); si++) {
+            plain = (UBYTE *)AllocMem(sizes[si] > 0UL ? sizes[si] : 1UL, MEMF_ANY);
+            if (plain == NULL) {
+                sprintf(label, "roundtrip pass=%lu size=%lu",
+                    (unsigned long)pass_idx, (unsigned long)sizes[si]);
+                zt_stress_note((STRPTR)label, FALSE, (STRPTR)"no plain mem");
+                continue;
+            }
+            if (sizes[si] > 0UL) {
+                zt_rng_fill(plain, sizes[si]);
+            }
+
+            for (wi = 0; wi < (ULONG)(sizeof(windows) / sizeof(windows[0])); wi++) {
+                for (li = 0; li < (ULONG)(sizeof(levels) / sizeof(levels[0])); li++) {
+                    for (ci = 0; ci < 2UL; ci++) {
+                        sprintf(label,
+                            "roundtrip pass=%lu size=%lu wrap=%s lvl=%ld %s",
+                            (unsigned long)pass_idx, (unsigned long)sizes[si],
+                            (char *)wrap_names[wi], (long)levels[li],
+                            ci ? "chunked" : "whole");
+                        (void)zt_stress_roundtrip_one(plain, sizes[si], levels[li],
+                            windows[wi], (BOOL)(ci != 0UL), (STRPTR)label);
+                    }
+                }
+            }
+
+            FreeMem(plain, sizes[si] > 0UL ? sizes[si] : 1UL);
+        }
+    }
+}
+
+static BOOL
+zt_stress_quick_ok(VOID)
+{
+    UBYTE comp[64];
+    UBYTE out[32];
+    ULONG comp_len;
+    ULONG out_len;
+    LONG rc;
+
+    comp_len = (ULONG)sizeof(comp);
+    rc = Compress2(comp, &comp_len, (CONST_APTR)zt_plain_hello,
+        (ULONG)strlen((char *)zt_plain_hello), Z_DEFAULT_COMPRESSION);
+    if (rc != Z_OK) {
+        return FALSE;
+    }
+    out_len = (ULONG)sizeof(out);
+    rc = Uncompress(out, &out_len, comp, comp_len);
+    if (rc != Z_OK) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static VOID
+zt_stress_negative(VOID)
+{
+    z_stream strm;
+    UBYTE out[64];
+    UBYTE garbage[128];
+    ULONG half;
+    ULONG i;
+    LONG rc;
+
+    half = (ULONG)sizeof(zt_zlib_hello) / 2UL;
+    zt_stream_clear(&strm);
+    rc = InflateInit(&strm);
+    if (rc != Z_OK) {
+        zt_stress_note((STRPTR)"neg/truncated init", FALSE, (STRPTR)"init");
+        return;
+    }
+    strm.next_in = (UBYTE *)zt_zlib_hello;
+    strm.avail_in = half;
+    strm.next_out = out;
+    strm.avail_out = (ULONG)sizeof(out);
+    rc = Inflate(&strm, Z_FINISH);
+    InflateEnd(&strm);
+    if (rc == Z_OK || rc == Z_STREAM_END) {
+        zt_stress_note((STRPTR)"neg/truncated zlib", FALSE, (STRPTR)"accepted");
+    } else {
+        zt_stress_note((STRPTR)"neg/truncated zlib", TRUE, NULL);
+    }
+
+    for (i = 0; i < (ULONG)sizeof(garbage); i++) {
+        garbage[i] = (UBYTE)(0xA5U ^ (UBYTE)i);
+    }
+    zt_stream_clear(&strm);
+    rc = InflateInit(&strm);
+    if (rc != Z_OK) {
+        zt_stress_note((STRPTR)"neg/garbage init", FALSE, (STRPTR)"init");
+        return;
+    }
+    strm.next_in = garbage;
+    strm.avail_in = (ULONG)sizeof(garbage);
+    strm.next_out = out;
+    strm.avail_out = (ULONG)sizeof(out);
+    rc = Inflate(&strm, Z_FINISH);
+    InflateEnd(&strm);
+    if (rc == Z_OK || rc == Z_STREAM_END) {
+        zt_stress_note((STRPTR)"neg/garbage zlib", FALSE, (STRPTR)"accepted");
+    } else {
+        zt_stress_note((STRPTR)"neg/garbage zlib", TRUE, NULL);
+    }
+
+    zt_stream_clear(&strm);
+    rc = InflateInit2(&strm, ZT_GZIP_WINDOW);
+    if (rc != Z_OK) {
+        zt_stress_note((STRPTR)"neg/gzip-inflate init", FALSE, (STRPTR)"init");
+        return;
+    }
+    strm.next_in = (UBYTE *)zt_zlib_hello;
+    strm.avail_in = (ULONG)sizeof(zt_zlib_hello);
+    strm.next_out = out;
+    strm.avail_out = (ULONG)sizeof(out);
+    rc = Inflate(&strm, Z_FINISH);
+    InflateEnd(&strm);
+    if (rc == Z_STREAM_END) {
+        zt_stress_note((STRPTR)"neg/gzip-inflate zlib blob", FALSE, (STRPTR)"accepted");
+    } else {
+        zt_stress_note((STRPTR)"neg/gzip-inflate zlib blob", TRUE, NULL);
+    }
+
+    zt_stream_clear(&strm);
+    rc = InflateInit2(&strm, ZT_RAW_WINDOW);
+    if (rc != Z_OK) {
+        zt_stress_note((STRPTR)"neg/raw-inflate init", FALSE, (STRPTR)"init");
+        return;
+    }
+    strm.next_in = (UBYTE *)zt_zlib_hello;
+    strm.avail_in = (ULONG)sizeof(zt_zlib_hello);
+    strm.next_out = out;
+    strm.avail_out = (ULONG)sizeof(out);
+    rc = Inflate(&strm, Z_FINISH);
+    InflateEnd(&strm);
+    if (rc == Z_STREAM_END) {
+        zt_stress_note((STRPTR)"neg/raw-inflate zlib blob", FALSE, (STRPTR)"accepted");
+    } else {
+        zt_stress_note((STRPTR)"neg/raw-inflate zlib blob", TRUE, NULL);
+    }
+
+    zt_stream_clear(&strm);
+    rc = DeflateInit(&strm, Z_DEFAULT_COMPRESSION);
+    if (rc != Z_OK) {
+        zt_stress_note((STRPTR)"neg/double DeflateEnd init", FALSE, (STRPTR)"init");
+        return;
+    }
+    rc = DeflateEnd(&strm);
+    if (rc != Z_OK) {
+        zt_stress_note((STRPTR)"neg/double DeflateEnd first", FALSE, (STRPTR)"end");
+        return;
+    }
+    rc = DeflateEnd(&strm);
+    if (rc == Z_STREAM_ERROR) {
+        zt_stress_note((STRPTR)"neg/double DeflateEnd", TRUE, NULL);
+    } else {
+        zt_stress_note((STRPTR)"neg/double DeflateEnd", FALSE, (STRPTR)"no error");
+    }
+
+    if (zt_stress_quick_ok()) {
+        zt_stress_note((STRPTR)"neg/recover after errors", TRUE, NULL);
+    } else {
+        zt_stress_note((STRPTR)"neg/recover after errors", FALSE, NULL);
+    }
+}
+
+static VOID
+zt_stress_soak(VOID)
+{
+    UBYTE *plain;
+    UBYTE *comp;
+    UBYTE *out;
+    ULONG plain_len;
+    ULONG comp_cap;
+    ULONG comp_len;
+    ULONG out_len;
+    ULONG mem_before;
+    ULONG mem_after;
+    LONG mem_delta;
+    ULONG i;
+    LONG rc;
+    char detail[64];
+
+    plain_len = ZT_BENCH_64K;
+    comp_cap = CompressBound(plain_len);
+    plain = (UBYTE *)AllocMem(plain_len, MEMF_ANY);
+    comp = (UBYTE *)AllocMem(comp_cap, MEMF_ANY);
+    out = (UBYTE *)AllocMem(plain_len, MEMF_ANY);
+    if (plain == NULL || comp == NULL || out == NULL) {
+        FreeMem(plain, plain_len);
+        FreeMem(comp, comp_cap);
+        FreeMem(out, plain_len);
+        zt_stress_note((STRPTR)"soak/setup", FALSE, (STRPTR)"no mem");
+        return;
+    }
+
+    zt_rng_seed(zt_stress_seed + 999UL);
+    zt_rng_fill(plain, plain_len);
+
+    mem_before = AvailMem(MEMF_ANY);
+    for (i = 0; i < ZT_STRESS_SOAK_ITERS; i++) {
+        comp_len = comp_cap;
+        rc = Compress2(comp, &comp_len, plain, plain_len, Z_DEFAULT_COMPRESSION);
+        if (rc != Z_OK) {
+            sprintf(detail, "compress iter=%lu rc=%ld",
+                (unsigned long)i, (long)rc);
+            zt_stress_note((STRPTR)"soak/Compress2", FALSE, (STRPTR)detail);
+            break;
+        }
+        out_len = plain_len;
+        rc = Uncompress(out, &out_len, comp, comp_len);
+        if (rc != Z_OK || out_len != plain_len
+            || memcmp(out, plain, plain_len) != 0) {
+            sprintf(detail, "uncompress iter=%lu rc=%ld",
+                (unsigned long)i, (long)rc);
+            zt_stress_note((STRPTR)"soak/Uncompress", FALSE, (STRPTR)detail);
+            break;
+        }
+    }
+    mem_after = AvailMem(MEMF_ANY);
+
+    FreeMem(plain, plain_len);
+    FreeMem(comp, comp_cap);
+    FreeMem(out, plain_len);
+
+    if (i < ZT_STRESS_SOAK_ITERS) {
+        return;
+    }
+
+    zt_stress_note((STRPTR)"soak/roundtrip", TRUE, NULL);
+
+    if (mem_after >= mem_before) {
+        mem_delta = (LONG)(mem_after - mem_before);
+    } else {
+        mem_delta = -(LONG)(mem_before - mem_after);
+    }
+    sprintf(detail, "iters=%lu mem_before=%lu mem_after=%lu delta=%ld",
+        (unsigned long)ZT_STRESS_SOAK_ITERS,
+        (unsigned long)mem_before, (unsigned long)mem_after, (long)mem_delta);
+    if (mem_delta >= -4096L) {
+        zt_stress_note((STRPTR)"soak/AvailMem", TRUE, (STRPTR)detail);
+    } else {
+        zt_stress_note((STRPTR)"soak/AvailMem", FALSE, (STRPTR)detail);
+    }
+}
+
+static VOID
+zt_run_stress(VOID)
+{
+    zt_stress_pass = 0;
+    zt_stress_fail = 0;
+
+    Printf("ZStress: z.library stress harness\n");
+    if (ZBase != NULL && ZBase->lib_IdString != NULL) {
+        Printf("ZStress: library=%s\n", ZBase->lib_IdString);
+    }
+    Printf("ZStress: seed=%lu passes=%lu\n",
+        (unsigned long)zt_stress_seed, (unsigned long)zt_stress_mult);
+    Flush(Output());
+
+    zt_stress_roundtrip_matrix();
+    zt_stress_negative();
+    zt_stress_soak();
+
+    Printf("ZStress: %lu passed, %lu failed\n",
+        zt_stress_pass, zt_stress_fail);
+    Flush(Output());
+}
 
 static VOID
 zt_note(STRPTR name, BOOL ok, STRPTR detail)
@@ -92,6 +674,544 @@ zt_stream_clear(z_stream *strm)
 {
     memset(strm, 0, sizeof(*strm));
     /* zalloc/zfree left NULL: use z.library pooled malloc (amihttp pattern). */
+}
+
+static VOID
+zt_flush(VOID)
+{
+    Flush(Output());
+}
+
+static VOID
+zt_et_init(VOID)
+{
+    if (LowLevelBase != NULL) {
+        return;
+    }
+    LowLevelBase = OpenLibrary((STRPTR)"lowlevel.library", 40);
+    if (LowLevelBase == NULL) {
+        return;
+    }
+    zt_et_ctx.ev_hi = 0UL;
+    zt_et_ctx.ev_lo = 0UL;
+    (void)ElapsedTime(&zt_et_ctx);
+}
+
+static VOID
+zt_et_fini(VOID)
+{
+    if (LowLevelBase != NULL) {
+        CloseLibrary(LowLevelBase);
+        LowLevelBase = NULL;
+    }
+}
+
+static VOID
+zt_et_reset(VOID)
+{
+    if (LowLevelBase == NULL) {
+        return;
+    }
+    zt_et_ctx.ev_hi = 0UL;
+    zt_et_ctx.ev_lo = 0UL;
+    (void)ElapsedTime(&zt_et_ctx);
+}
+
+static ULONG
+zt_et_delta_ms(VOID)
+{
+    ULONG et;
+    ULONG sec;
+    ULONG frac;
+
+    if (LowLevelBase == NULL) {
+        return 0UL;
+    }
+    et = ElapsedTime(&zt_et_ctx);
+    sec = (et >> 16) & 0xFFFFUL;
+    frac = et & 0xFFFFUL;
+    return (sec * 1000UL) + ((frac * 1000UL) / 65536UL);
+}
+
+static VOID
+zt_bench_printf(STRPTR fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsprintf(buf, (const char *)fmt, ap);
+    va_end(ap);
+    Printf("%s", buf);
+    zt_flush();
+}
+
+static VOID
+zt_bench_report(STRPTR name, ULONG bytes, ULONG iters, ULONG total_ms,
+    ULONG min_ms, ULONG max_ms)
+{
+    ULONG avg;
+    ULONG kbps;
+
+    if (iters == 0UL) {
+        return;
+    }
+    avg = (total_ms + (iters / 2UL)) / iters;
+    if (total_ms > 0UL && bytes > 0UL) {
+        kbps = ((bytes * iters) / total_ms) * 1000UL / 1024UL;
+    } else {
+        kbps = 0UL;
+    }
+    zt_bench_printf(
+        "ZBench: %s bytes=%lu iterations=%lu total_ms=%lu avg_ms=%lu min_ms=%lu max_ms=%lu ~%lu KB/s\n",
+        name, (unsigned long)bytes, (unsigned long)iters,
+        (unsigned long)total_ms, (unsigned long)avg,
+        (unsigned long)min_ms, (unsigned long)max_ms,
+        (unsigned long)kbps);
+}
+
+static VOID
+zt_bench_report_one(STRPTR name, ULONG ms, STRPTR detail)
+{
+    if (detail != NULL && detail[0] != '\0') {
+        zt_bench_printf("ZBench: %s ms=%lu (%s)\n",
+            name, (unsigned long)ms, detail);
+    } else {
+        zt_bench_printf("ZBench: %s ms=%lu\n",
+            name, (unsigned long)ms);
+    }
+}
+
+static UBYTE *
+zt_bench_alloc_payload(ULONG size)
+{
+    static const char pattern[] =
+        "Hello, Amiga! The quick brown fox jumps over the lazy dog. ";
+    UBYTE *buf;
+    ULONG i;
+    ULONG plen;
+
+    buf = (UBYTE *)AllocMem(size, MEMF_ANY);
+    if (buf == NULL) {
+        return NULL;
+    }
+    plen = (ULONG)strlen(pattern);
+    for (i = 0; i < size; i++) {
+        buf[i] = (UBYTE)pattern[i % plen];
+    }
+    return buf;
+}
+
+static ULONG
+zt_bench_compress2_ms(CONST_APTR src, ULONG src_len, LONG level)
+{
+    UBYTE *dest;
+    ULONG dest_len;
+    ULONG bound;
+    ULONG ms;
+    LONG rc;
+
+    bound = CompressBound(src_len);
+    dest = (UBYTE *)AllocMem(bound, MEMF_ANY);
+    if (dest == NULL) {
+        return 0UL;
+    }
+
+    zt_et_reset();
+    dest_len = bound;
+    rc = Compress2(dest, &dest_len, src, src_len, level);
+    ms = zt_et_delta_ms();
+
+    FreeMem(dest, bound);
+    if (rc != Z_OK) {
+        return 0UL;
+    }
+    if (ms == 0UL) {
+        ms = 1UL;
+    }
+    return ms;
+}
+
+static ULONG
+zt_bench_uncompress_ms(CONST_APTR comp, ULONG comp_len, ULONG plain_len)
+{
+    UBYTE *dest;
+    ULONG dest_len;
+    ULONG ms;
+    LONG rc;
+
+    dest = (UBYTE *)AllocMem(plain_len, MEMF_ANY);
+    if (dest == NULL) {
+        return 0UL;
+    }
+
+    zt_et_reset();
+    dest_len = plain_len;
+    rc = Uncompress(dest, &dest_len, comp, comp_len);
+    ms = zt_et_delta_ms();
+
+    FreeMem(dest, plain_len);
+    if (rc != Z_OK || dest_len != plain_len) {
+        return 0UL;
+    }
+    if (ms == 0UL) {
+        ms = 1UL;
+    }
+    return ms;
+}
+
+static ULONG
+zt_bench_deflate_ms(CONST_APTR src, ULONG src_len, LONG level)
+{
+    z_stream strm;
+    UBYTE *dest;
+    ULONG bound;
+    ULONG ms;
+    LONG rc;
+
+    bound = src_len + (src_len / 10UL) + 128UL;
+    dest = (UBYTE *)AllocMem(bound, MEMF_ANY);
+    if (dest == NULL) {
+        return 0UL;
+    }
+
+    zt_stream_clear(&strm);
+    rc = DeflateInit2(&strm, level, Z_DEFLATED, ZT_RAW_WINDOW, 8,
+        Z_DEFAULT_STRATEGY);
+    if (rc != Z_OK) {
+        FreeMem(dest, bound);
+        return 0UL;
+    }
+
+    zt_et_reset();
+    strm.next_in = (UBYTE *)src;
+    strm.avail_in = src_len;
+    strm.next_out = dest;
+    strm.avail_out = bound;
+    rc = Deflate(&strm, Z_FINISH);
+    ms = zt_et_delta_ms();
+    DeflateEnd(&strm);
+
+    FreeMem(dest, bound);
+    if (rc != Z_STREAM_END) {
+        return 0UL;
+    }
+    if (ms == 0UL) {
+        ms = 1UL;
+    }
+    return ms;
+}
+
+static ULONG
+zt_bench_inflate_ms(CONST_APTR comp, ULONG comp_len, ULONG plain_len)
+{
+    z_stream strm;
+    UBYTE *dest;
+    ULONG ms;
+    LONG rc;
+
+    dest = (UBYTE *)AllocMem(plain_len, MEMF_ANY);
+    if (dest == NULL) {
+        return 0UL;
+    }
+
+    zt_stream_clear(&strm);
+    rc = InflateInit2(&strm, ZT_RAW_WINDOW);
+    if (rc != Z_OK) {
+        FreeMem(dest, plain_len);
+        return 0UL;
+    }
+
+    zt_et_reset();
+    strm.next_in = (UBYTE *)comp;
+    strm.avail_in = comp_len;
+    strm.next_out = dest;
+    strm.avail_out = plain_len;
+    rc = Inflate(&strm, Z_FINISH);
+    ms = zt_et_delta_ms();
+    InflateEnd(&strm);
+
+    FreeMem(dest, plain_len);
+    if (rc != Z_STREAM_END) {
+        return 0UL;
+    }
+    if (ms == 0UL) {
+        ms = 1UL;
+    }
+    return ms;
+}
+
+static ULONG
+zt_bench_adler32_ms(CONST_APTR src, ULONG src_len)
+{
+    ULONG ms;
+
+    zt_et_reset();
+    (void)Adler32(Adler32(0, NULL, 0), src, src_len);
+    ms = zt_et_delta_ms();
+    if (ms == 0UL) {
+        ms = 1UL;
+    }
+    return ms;
+}
+
+static ULONG
+zt_bench_crc32_ms(CONST_APTR src, ULONG src_len)
+{
+    ULONG ms;
+
+    zt_et_reset();
+    (void)CRC32(CRC32(0, NULL, 0), src, src_len);
+    ms = zt_et_delta_ms();
+    if (ms == 0UL) {
+        ms = 1UL;
+    }
+    return ms;
+}
+
+static VOID
+zt_bench_loop(STRPTR name, ULONG bytes, ULONG (*fn)(VOID))
+{
+    ULONG i;
+    ULONG total;
+    ULONG min_ms;
+    ULONG max_ms;
+    ULONG ms;
+    ULONG ok;
+
+    total = 0UL;
+    min_ms = 0xFFFFFFFFUL;
+    max_ms = 0UL;
+    ok = 0UL;
+
+    for (i = 0; i < zt_bench_iters; i++) {
+        ms = fn();
+        if (ms == 0UL) {
+            zt_bench_printf("ZBench: %s iter=%lu failed\n",
+                name, (unsigned long)i);
+            continue;
+        }
+        ok++;
+        total += ms;
+        if (ms < min_ms) {
+            min_ms = ms;
+        }
+        if (ms > max_ms) {
+            max_ms = ms;
+        }
+    }
+
+    if (ok == 0UL) {
+        zt_bench_printf("ZBench: %s FAILED (no successful iterations)\n", name);
+        return;
+    }
+    zt_bench_report(name, bytes, ok, total, min_ms, max_ms);
+}
+
+/* Bench context passed through a single fn pointer for zt_bench_loop. */
+struct zt_bench_ctx {
+    CONST_APTR src;
+    ULONG src_len;
+    CONST_APTR comp;
+    ULONG comp_len;
+    CONST_APTR raw_comp;
+    ULONG raw_comp_len;
+    ULONG plain_len;
+    LONG level;
+    ULONG kind;
+};
+
+#define ZT_BENCH_COMPRESS2  1
+#define ZT_BENCH_UNCOMPRESS 2
+#define ZT_BENCH_DEFLATE    3
+#define ZT_BENCH_INFLATE    4
+#define ZT_BENCH_ADLER32    5
+#define ZT_BENCH_CRC32      6
+
+static struct zt_bench_ctx zt_bench_active;
+
+static ULONG
+zt_bench_dispatch(VOID)
+{
+    switch (zt_bench_active.kind) {
+    case ZT_BENCH_COMPRESS2:
+        return zt_bench_compress2_ms(zt_bench_active.src,
+            zt_bench_active.src_len, zt_bench_active.level);
+    case ZT_BENCH_UNCOMPRESS:
+        return zt_bench_uncompress_ms(zt_bench_active.comp,
+            zt_bench_active.comp_len, zt_bench_active.plain_len);
+    case ZT_BENCH_DEFLATE:
+        return zt_bench_deflate_ms(zt_bench_active.src,
+            zt_bench_active.src_len, zt_bench_active.level);
+    case ZT_BENCH_INFLATE:
+        return zt_bench_inflate_ms(zt_bench_active.raw_comp,
+            zt_bench_active.raw_comp_len, zt_bench_active.plain_len);
+    case ZT_BENCH_ADLER32:
+        return zt_bench_adler32_ms(zt_bench_active.src,
+            zt_bench_active.src_len);
+    case ZT_BENCH_CRC32:
+        return zt_bench_crc32_ms(zt_bench_active.src,
+            zt_bench_active.src_len);
+    default:
+        return 0UL;
+    }
+}
+
+static BOOL
+zt_bench_raw_compress(CONST_APTR src, ULONG src_len, UBYTE *dest, ULONG dest_cap,
+    ULONG *out_len)
+{
+    z_stream strm;
+    LONG rc;
+
+    zt_stream_clear(&strm);
+    rc = DeflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, ZT_RAW_WINDOW, 8,
+        Z_DEFAULT_STRATEGY);
+    if (rc != Z_OK) {
+        return FALSE;
+    }
+    strm.next_in = (UBYTE *)src;
+    strm.avail_in = src_len;
+    strm.next_out = dest;
+    strm.avail_out = dest_cap;
+    rc = Deflate(&strm, Z_FINISH);
+    *out_len = dest_cap - strm.avail_out;
+    DeflateEnd(&strm);
+    return (BOOL)(rc == Z_STREAM_END);
+}
+
+static VOID
+zt_bench_size(ULONG size, char *label)
+{
+    UBYTE *plain;
+    UBYTE *comp;
+    UBYTE *raw_comp;
+    ULONG comp_len;
+    ULONG raw_comp_len;
+    ULONG bound;
+    ULONG raw_bound;
+    LONG rc;
+    char name[80];
+
+    plain = zt_bench_alloc_payload(size);
+    if (plain == NULL) {
+        zt_bench_printf("ZBench: (skip %lu bytes; no payload mem)\n",
+            (unsigned long)size);
+        return;
+    }
+
+    bound = CompressBound(size);
+    comp = (UBYTE *)AllocMem(bound, MEMF_ANY);
+    if (comp == NULL) {
+        FreeMem(plain, size);
+        zt_bench_printf("ZBench: (skip %lu bytes; no compress mem)\n",
+            (unsigned long)size);
+        return;
+    }
+
+    comp_len = bound;
+    rc = Compress2(comp, &comp_len, plain, size, Z_DEFAULT_COMPRESSION);
+    if (rc != Z_OK) {
+        FreeMem(comp, bound);
+        FreeMem(plain, size);
+        zt_bench_printf("ZBench: (skip %lu bytes; pre-compress failed rc=%ld)\n",
+            (unsigned long)size, (long)rc);
+        return;
+    }
+
+    raw_bound = size + (size / 10UL) + 128UL;
+    raw_comp = (UBYTE *)AllocMem(raw_bound, MEMF_ANY);
+    if (raw_comp == NULL) {
+        FreeMem(comp, bound);
+        FreeMem(plain, size);
+        zt_bench_printf("ZBench: (skip %lu bytes; no raw compress mem)\n",
+            (unsigned long)size);
+        return;
+    }
+    if (!zt_bench_raw_compress(plain, size, raw_comp, raw_bound, &raw_comp_len)) {
+        FreeMem(raw_comp, raw_bound);
+        FreeMem(comp, bound);
+        FreeMem(plain, size);
+        zt_bench_printf("ZBench: (skip %lu bytes; raw pre-compress failed)\n",
+            (unsigned long)size);
+        return;
+    }
+
+    sprintf(label, "%lu", (unsigned long)size);
+
+    zt_bench_active.src = plain;
+    zt_bench_active.src_len = size;
+    zt_bench_active.comp = comp;
+    zt_bench_active.comp_len = comp_len;
+    zt_bench_active.raw_comp = raw_comp;
+    zt_bench_active.raw_comp_len = raw_comp_len;
+    zt_bench_active.plain_len = size;
+
+    zt_bench_active.level = 1;
+    zt_bench_active.kind = ZT_BENCH_COMPRESS2;
+    sprintf(name, "compress2_l1_%s", label);
+    zt_bench_loop((STRPTR)name, size, zt_bench_dispatch);
+
+    zt_bench_active.level = 6;
+    sprintf(name, "compress2_l6_%s", label);
+    zt_bench_loop((STRPTR)name, size, zt_bench_dispatch);
+
+    zt_bench_active.level = 9;
+    sprintf(name, "compress2_l9_%s", label);
+    zt_bench_loop((STRPTR)name, size, zt_bench_dispatch);
+
+    zt_bench_active.kind = ZT_BENCH_UNCOMPRESS;
+    sprintf(name, "uncompress_%s", label);
+    zt_bench_loop((STRPTR)name, size, zt_bench_dispatch);
+
+    zt_bench_active.level = Z_DEFAULT_COMPRESSION;
+    zt_bench_active.kind = ZT_BENCH_DEFLATE;
+    sprintf(name, "deflate_raw_%s", label);
+    zt_bench_loop((STRPTR)name, size, zt_bench_dispatch);
+
+    zt_bench_active.kind = ZT_BENCH_INFLATE;
+    sprintf(name, "inflate_raw_%s", label);
+    zt_bench_loop((STRPTR)name, size, zt_bench_dispatch);
+
+    if (size >= ZT_BENCH_4K) {
+        zt_bench_active.kind = ZT_BENCH_ADLER32;
+        sprintf(name, "adler32_%s", label);
+        zt_bench_loop((STRPTR)name, size, zt_bench_dispatch);
+
+        zt_bench_active.kind = ZT_BENCH_CRC32;
+        sprintf(name, "crc32_%s", label);
+        zt_bench_loop((STRPTR)name, size, zt_bench_dispatch);
+    }
+
+    FreeMem(raw_comp, raw_bound);
+    FreeMem(comp, bound);
+    FreeMem(plain, size);
+}
+
+static VOID
+zt_run_bench(VOID)
+{
+    char label[16];
+
+    zt_et_init();
+    if (LowLevelBase == NULL) {
+        zt_bench_printf("ZBench: lowlevel.library not available (need V40+)\n");
+        return;
+    }
+
+    if (ZBase != NULL && ZBase->lib_IdString != NULL) {
+        zt_bench_printf("ZBench: library=%s\n", ZBase->lib_IdString);
+    } else {
+        zt_bench_printf("ZBench: library=(unknown)\n");
+    }
+
+    zt_bench_printf("ZBench: iterations=%lu\n",
+        (unsigned long)zt_bench_iters);
+
+    zt_bench_size(ZT_BENCH_4K, label);
+    zt_bench_size(ZT_BENCH_64K, label);
+
+    zt_et_fini();
 }
 
 static BOOL
@@ -1261,20 +2381,107 @@ zt_test_deflate_gzip_roundtrip(VOID)
 int
 main(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    int i;
 
     zt_pass = 0;
     zt_fail = 0;
+    zt_bench_mode = FALSE;
+    zt_bench_only = FALSE;
+    zt_bench_iters = 3UL;
+    zt_stress_mode = FALSE;
+    zt_stress_only = FALSE;
+    zt_stress_mult = 1UL;
+    zt_stress_seed = 0x5eed1234UL;
 
-    Printf("ZTest: z.library full API harness\n");
-    Printf("ZTest: sizeof(z_stream)=%lu\n", (unsigned long)sizeof(z_stream));
-    Flush(Output());
+    for (i = 1; i < argc; i++) {
+        if (argv[i] != NULL && strcmp(argv[i], "-bench-only") == 0) {
+            zt_bench_mode = TRUE;
+            zt_bench_only = TRUE;
+            if (i + 1 < argc && argv[i + 1] != NULL
+                && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+                ULONG n;
+
+                n = (ULONG)strtoul(argv[i + 1], NULL, 10);
+                if (n > 0UL) {
+                    zt_bench_iters = n;
+                    i++;
+                }
+            }
+        } else if (argv[i] != NULL && strcmp(argv[i], "-bench") == 0) {
+            zt_bench_mode = TRUE;
+            if (i + 1 < argc && argv[i + 1] != NULL
+                && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+                ULONG n;
+
+                n = (ULONG)strtoul(argv[i + 1], NULL, 10);
+                if (n > 0UL) {
+                    zt_bench_iters = n;
+                    i++;
+                }
+            }
+        } else if (argv[i] != NULL && strcmp(argv[i], "-stress-only") == 0) {
+            zt_stress_mode = TRUE;
+            zt_stress_only = TRUE;
+            if (i + 1 < argc && argv[i + 1] != NULL
+                && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+                ULONG n;
+
+                n = (ULONG)strtoul(argv[i + 1], NULL, 10);
+                if (n > 0UL) {
+                    zt_stress_mult = n;
+                    i++;
+                }
+            }
+        } else if (argv[i] != NULL && strcmp(argv[i], "-stress") == 0) {
+            zt_stress_mode = TRUE;
+            if (i + 1 < argc && argv[i + 1] != NULL
+                && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+                ULONG n;
+
+                n = (ULONG)strtoul(argv[i + 1], NULL, 10);
+                if (n > 0UL) {
+                    zt_stress_mult = n;
+                    i++;
+                }
+            }
+        } else if (argv[i] != NULL && strcmp(argv[i], "-seed") == 0) {
+            if (i + 1 < argc && argv[i + 1] != NULL) {
+                i++;
+                zt_stress_seed = (ULONG)strtoul(argv[i], NULL, 10);
+            }
+        }
+    }
+
+    if (!zt_bench_only && !zt_stress_only) {
+        Printf("ZTest: z.library full API harness\n");
+        Printf("ZTest: sizeof(z_stream)=%lu\n", (unsigned long)sizeof(z_stream));
+        Flush(Output());
+    }
 
     if (!zt_test_open()) {
         Printf("ZTest: %lu passed, %lu failed (library missing)\n",
             zt_pass, zt_fail);
         return 20;
+    }
+
+    if (zt_bench_mode) {
+        zt_run_bench();
+    }
+
+    if (zt_bench_only) {
+        CloseLibrary(ZBase);
+        ZBase = NULL;
+        return 0;
+    }
+
+    if (zt_stress_only) {
+        zt_run_stress();
+        CloseLibrary(ZBase);
+        ZBase = NULL;
+        if (zt_stress_fail > 0) {
+            return 10;
+        }
+        return 0;
     }
 
     zt_test_version();
@@ -1298,13 +2505,21 @@ main(int argc, char **argv)
     zt_test_gzip_chunked();
     zt_test_deflate_gzip_roundtrip();
 
+    if (zt_stress_mode) {
+        zt_run_stress();
+    }
+
     CloseLibrary(ZBase);
     ZBase = NULL;
 
     Printf("ZTest: %lu passed, %lu failed\n", zt_pass, zt_fail);
+    if (zt_stress_mode) {
+        Printf("ZStress: %lu passed, %lu failed\n",
+            zt_stress_pass, zt_stress_fail);
+    }
     Flush(Output());
 
-    if (zt_fail > 0) {
+    if (zt_fail > 0 || (zt_stress_mode && zt_stress_fail > 0)) {
         return 10;
     }
     return 0;
