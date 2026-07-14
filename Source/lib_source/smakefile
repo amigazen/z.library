@@ -4,7 +4,7 @@
 # Targets:
 #   smake          -> z.library (shared, full zlib + LVO functable)
 #   smake static   -> zlib.lib  (static core deflate/inflate only, Z_SOLO)
-#   smake stubs    -> zlibstubs.lib (autoinit + zlib-name stubs -> LVOs)
+#   smake stubs    -> zlibstubs.lib (autoinit_z_base.o + z_stubs.o -> LVOs)
 #
 # Note: SAS/C names object files with OBJNAME= (not slink's TO).
 
@@ -43,9 +43,11 @@ $(TARGET): $(LIB_OBJS) smakefile.wth $(BUILD_H)
 	$(LD) WITH smakefile.wth WITH LIB:utillib.with
 
 $(STATIC): $(STATIC_OBJS)
+	-$(RM) $(STATIC)
 	$(OML) $(STATIC) r $(STATIC_OBJS)
 
 $(STUBS): $(STUB_OBJS)
+	-$(RM) $(STUBS)
 	$(OML) $(STUBS) r $(STUB_OBJS)
 
 StartUp.o: StartUp.c $(BUILD_H) z_funcs.h compiler.h
@@ -120,7 +122,7 @@ zutil_s.o: zlib/zutil.c zlib/zlib.h zlib/zconf.h zlib/zutil.h
 static/autoinit_z_base.o: static/autoinit_z_base.c
 	$(CC) static/autoinit_z_base.c OBJNAME=static/autoinit_z_base.o
 
-static/z_stubs.o: static/z_stubs.c zlib/zlib.h
+static/z_stubs.o: static/z_stubs.c static/z_stub_open.h zlib/zlib.h
 	$(CC) idir=zlib static/z_stubs.c OBJNAME=static/z_stubs.o
 
 release:
@@ -135,10 +137,12 @@ installstatic:
 
 headers:
 	Copy clone /include/libraries/z.h //SDK/Include_h/libraries/z.h
-	Copy clone /include/z/zbase.h //SDK/Include_h/z/zbase.h
 	Copy clone /include/proto/z.h //SDK/Include_h/proto/z.h
 	Copy clone /include/clib/z_protos.h //SDK/Include_h/clib/z_protos.h
 	Copy clone /include/pragmas/z_pragmas.h //SDK/Include_h/pragmas/z_pragmas.h
+	Copy clone /include/pragma/z_lib.h //SDK/Include_h/pragma/z_lib.h
+	Copy clone /include/inline/z.h //SDK/Include_h/inline/z.h
+	Copy clone /include/inline/z_protos.h //SDK/Include_h/inline/z_protos.h
 	Copy clone zlib/zlib.h //SDK/Include_h/zlib/zlib.h
 	Copy clone zlib/zconf.h //SDK/Include_h/zlib/zconf.h
 
@@ -148,6 +152,7 @@ clean:
 	-$(RM) inftrees_s.o inffast_s.o trees_s.o zutil_s.o
 	-$(RM) zlib/\#?.o
 	-$(RM) static/\#?.o
+	-$(RM) static/autoinit_z_base.o
 	-$(RM) $(TARGET)
 	-$(RM) $(TARGET).info
 	-$(RM) $(STATIC)

@@ -17,7 +17,7 @@
 
 #include <proto/exec.h>
 
-#include <z/zbase.h>
+#include "private/zbase.h"
 #include "private/z_build.h"
 #include "compiler.h"
 #include "zlib.h"
