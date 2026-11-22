@@ -10,10 +10,12 @@
 #  define OF(args)  ()
 #endif
 
-#ifdef __STDC__
+#ifndef ZLIB_H
+#  ifdef __STDC__
    typedef void *voidp;
-#else
+#  else
    typedef char *voidp;
+#  endif
 #endif
 
 /* I don't like nested includes, but the string and io functions are used
@@ -275,6 +277,12 @@ extern int unlzh      OF((int in, int out));
 	/* in gzip.c */
 RETSIGTYPE abort_gzip OF((void));
 
+#ifdef USE_ZLIB
+        /* in zglue.c (z.library zlib) */
+extern uch gz_zlib_extra_flags OF((void));
+extern int gz_zlib_compress   OF((void));
+extern int gz_zlib_inflate    OF((void));
+#else
         /* in deflate.c */
 void lm_init OF((int pack_level, ush *flags));
 ulg  deflate OF((void));
@@ -283,6 +291,7 @@ ulg  deflate OF((void));
 void ct_init     OF((ush *attr, int *method));
 int  ct_tally    OF((int dist, int lc));
 ulg  flush_block OF((char *buf, ulg stored_len, int eof));
+#endif /* USE_ZLIB */
 
         /* in bits.c */
 void     bi_init    OF((file_t zipfile));
@@ -311,5 +320,7 @@ extern void write_error   OF((void));
 extern void display_ratio OF((long num, long den, FILE *file));
 extern voidp xmalloc      OF((unsigned int size));
 
+#ifndef USE_ZLIB
 	/* in inflate.c */
 extern int inflate OF((void));
+#endif

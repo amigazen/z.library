@@ -180,7 +180,9 @@
 #  define OS_CODE  0x01
 #  ifndef __GNUC__ /* SASC */
 #    define NO_STDIN_FSTAT
-#    define ASMV
+#    ifndef USE_ZLIB
+#      define ASMV
+#    endif
 #    define SYSDIR
 #    define NO_SYMLINK
 #    define NO_CHOWN

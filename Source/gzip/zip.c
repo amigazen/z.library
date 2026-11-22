@@ -34,8 +34,10 @@ int zip(in, out)
     int in, out;            /* input and output file descriptors */
 {
     uch  flags = 0;         /* general purpose bit flags */
+#ifndef USE_ZLIB
     ush  attr = 0;          /* ascii/binary flag */
     ush  deflate_flags = 0; /* pkzip -es, -en or -ex equivalent */
+#endif
 
     ifd = in;
     ofd = out;
@@ -58,10 +60,14 @@ int zip(in, out)
     crc = updcrc(0, 0);
 
     bi_init(out);
+
+#ifdef USE_ZLIB
+    put_byte(gz_zlib_extra_flags()); /* extra flags */
+#else
     ct_init(&attr, &method);
     lm_init(level, &deflate_flags);
-
     put_byte((uch)deflate_flags); /* extra flags */
+#endif
     put_byte(OS_CODE);            /* OS identifier */
 
     if (save_orig_name) {
@@ -72,7 +78,20 @@ int zip(in, out)
     }
     header_bytes = (long)outcnt;
 
+#ifdef USE_ZLIB
+    {
+	int zerr;
+
+	zerr = gz_zlib_compress();
+	if (zerr == 3) {
+	    error("out of memory");
+	} else if (zerr != 0) {
+	    error("compression error");
+	}
+    }
+#else
     (void)deflate();
+#endif
 
 #if !defined(NO_SIZE_CHECK) && !defined(RECORD_IO)
   /* Check input size (but not in VMS -- variable record lengths mess it up)

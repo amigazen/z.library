@@ -3,6 +3,15 @@
 # Don't use it with SAS/C 6.2 or earlier versions. These versions will
 # produce incorrect code for trees.c because of a bug in the optimizer.
 # Made by Carsten Steger (carsten.steger@informatik.tu-muenchen.de)
+#
+# z.library variants (gzip_staticZ / gzip_lvoZ):
+#   Build z.library first in Source/lib_source:
+#     smake static   -> zlib.lib
+#     smake stubs    -> zlibstubs.lib
+#   Optional: smake installstatic (LIBS:zlib.lib) and install z.library
+#   for runtime. gzip_lvoZ needs z.library v2 on LIBS: at run time.
+#
+# Note: SAS/C names object files with OBJNAME= (not slink's TO).
 
 # Some notes on gzip for the Amiga:
 # Due to a strange implementation of the RAM-Disk on Commodore's part
@@ -21,24 +30,43 @@ CC = sc
 
 # If you have a 68020 or more you can define UNALIGNED_OK below
 DEFS = DEF=AMIGA
+DEFS_Z = DEF=AMIGA DEF=USE_ZLIB
+
+# zlib headers and libs (relative to Source/gzip; adjust if your tree differs)
+ZINCDIR = IDIR=/lib_source/zlib
+
 LIBS = LIB LIB:scnb.lib
+ZLIB_STATIC = LIB /lib_source/zlib.lib
+ZLIB_STUBS  = LIB /lib_source/zlibstubs.lib
 
 CFLAGS = DATA=FAR NOSTKCHK PARM=R IDIR=
 OPTFLAGS = OPT OPTGO OPTPEEP OPTCOMP=3 OPTDEP=3 OPTRDEP=3
 LDFLAGS = FROM LIB:c.o
 
-OBJS = gzip.o zip.o deflate.o trees.o bits.o unzip.o inflate.o util.o \
+# Classic self-contained gzip (embedded deflate/inflate from gzip 1.2.4)
+OBJS_CLASSIC = gzip.o zip.o deflate.o trees.o bits.o unzip.o inflate.o util.o \
       crypt.o lzw.o unlzw.o unpack.o unlzh.o getopt.o tailor.o match.o
+
+# z.library-backed gzip (deflate/inflate via zlib API)
+OBJS_ZLIB = gzip_z.o zip_z.o bits.o unzip_z.o util.o zglue.o \
+      crypt.o lzw.o unlzw.o unpack.o unlzh.o getopt.o tailor.o
 
 .c.o:
 	$(CC) $(DEFS) $(CFLAGS) $(OPTFLAGS) $<
+
 .a.o:
 	$(CC) $(DEFS) $(CFLAGS) $<
 
-all: gzip
+all: gzip_staticZ gzip_lvoZ
 
-gzip: $(OBJS)
-	slink $(LDFLAGS) $(OBJS) TO $@ $(LIBS)
+gzip: $(OBJS_CLASSIC)
+	slink $(LDFLAGS) $(OBJS_CLASSIC) TO $@ $(LIBS)
+
+gzip_staticZ: $(OBJS_ZLIB)
+	slink $(LDFLAGS) $(OBJS_ZLIB) TO $@ $(LIBS) $(ZLIB_STATIC)
+
+gzip_lvoZ: $(OBJS_ZLIB)
+	slink $(LDFLAGS) $(OBJS_ZLIB) TO $@ $(LIBS) $(ZLIB_STUBS)
 
 gzip.o: gzip.c gzip.h tailor.h revision.h lzw.h getopt.h
 zip.o: zip.c gzip.h tailor.h crypt.h
@@ -55,5 +83,17 @@ unlzh.o: unlzh.c gzip.h tailor.h lzw.h
 crypt.o: crypt.c
 getopt.o: getopt.c getopt.h
 tailor.o: tailor.c
+
+gzip_z.o: gzip.c gzip.h tailor.h revision.h lzw.h getopt.h
+	$(CC) $(DEFS_Z) $(CFLAGS) $(OPTFLAGS) $(ZINCDIR) gzip.c OBJNAME=gzip_z.o
+
+zip_z.o: zip.c gzip.h tailor.h crypt.h
+	$(CC) $(DEFS_Z) $(CFLAGS) $(OPTFLAGS) $(ZINCDIR) zip.c OBJNAME=zip_z.o
+
+unzip_z.o: unzip.c gzip.h tailor.h crypt.h
+	$(CC) $(DEFS_Z) $(CFLAGS) $(OPTFLAGS) $(ZINCDIR) unzip.c OBJNAME=unzip_z.o
+
+zglue.o: zglue.c gzip.h tailor.h
+	$(CC) $(DEFS_Z) $(CFLAGS) $(OPTFLAGS) $(ZINCDIR) zglue.c OBJNAME=zglue.o
 
 match.o: match.a

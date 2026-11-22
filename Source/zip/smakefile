@@ -18,13 +18,17 @@
 
 # Available targets:
 # all           builds all executeables below
-# zip           builds zip executeable
+# zip           builds zip executeable (built-in deflate)
+# zip_staticZ   zip linked against static zlib.lib from lib_source
+# zip_lvoZ      zip linked against zlibstubs.lib (needs z.library at run time)
 # zipsplit      builds zipsplit executeable
 # zipcloak      builds zipcloak executeable
 # zipnote       builds zipnote executeable
 # ziplm         builds low memory version of zip executable
 # clean         remove all files created by the compilation
 # spotless      like clean target but removes binaries too
+#
+# z.library variants: build Source/lib_source first (smake static / smake stubs)
 
 
 ##########################
@@ -87,6 +91,13 @@ AUSECPU = 0
 CSTACK = NOSTACKCHECK STACKEXTEND     # slow, but always works
 #CSTACK = STACKCHECK NOSTACKEXTEND    # slow, requester & graceful exit
 #CSTACK = NOSTACKCHECK NOSTACKEXTEND  # faster but relies on larger stack (>=10K)
+
+# z.library paths (relative to Source/zip; adjust ZLIBDIR if needed)
+ZLIBDIR     = /lib_source
+ZINCDIR     = IDIR=$(ZLIBDIR)/zlib
+ZLIB_STATIC = LIB $(ZLIBDIR)/zlib.lib
+ZLIB_STUBS  = LIB $(ZLIBDIR)/zlibstubs.lib
+CDEFZLIB    = DEF=USE_ZLIB DEF=USE_OWN_CRCTAB
 
 
 #
@@ -265,6 +276,7 @@ CFILE = scoptions-zip
 
 # Temp filenames for object lists to load using linker "WITH" command.
 OBJLISTZ = zip_objlist.with            # Zip      object list
+OBJLISTZZ = zip_z_objlist.with         # Zip z.library object list
 OBJLISTN = zipnote_objlist.with        # ZipNote  object list
 OBJLISTC = zipcloak_objlist.with       # ZipCloak object list
 OBJLISTS = zipsplit_objlist.with       # ZipSplit object list
@@ -274,6 +286,8 @@ OBJLISTL = ziplm_objlist.with          # Zip low-mem object list
 # Filenames to store linker options
 #
 LWITHZ = zip.lnk                       # zip      linker options
+LWITHZZS = zip_z_static.lnk            # zip_staticZ linker options
+LWITHZZL = zip_z_lvo.lnk               # zip_lvoZ linker options
 LWITHN = zipnote.lnk                   # zipnote  linker options
 LWITHC = zipcloak.lnk                  # zipcloak linker options
 LWITHS = zipsplit.lnk                  # zipsplit linker options
@@ -364,6 +378,12 @@ OBJZI = deflate$(O) trees$(O)
 OBJZA = amiga$(O) amigazip$(O) time_lib$(O) stat$(O) filedate$(O)
 OBJZ  = $(OBJZ1) $(OBJZ2) $(OBJZI) $(OBJZA)
 
+# Zip using z.library zlib (no built-in deflate/crc32)
+OBJZZ1 = zip_z$(O) zipfile$(O) zipup_z$(O) fileio$(O) util$(O) globals$(O)
+OBJZZ2 = crctab$(O) crypt$(O) ttyio$(O)
+OBJZZA = amiga$(O) amigazip$(O) time_lib$(O) stat$(O) filedate$(O)
+OBJZZ  = $(OBJZZ1) $(OBJZZ2) $(OBJZZA)
+
 # Shared utility objects for ZipNote, ZipCloak and ZipSplit
 OBJU1 = globals$(O)
 OBJUU = zipfile$(OU) fileio$(OU) util$(OU)
@@ -402,6 +422,7 @@ ZIPS  = Zip ZipNote ZipCloak ZipSplit ZipLM
 
 # Temp filenames for object lists to load using linker "WITH" command.
 OBJLISTZ = zip_objlist.with            # Zip      object list
+OBJLISTZZ = zip_z_objlist.with         # Zip z.library object list
 OBJLISTN = zipnote_objlist.with        # ZipNote  object list
 OBJLISTC = zipcloak_objlist.with       # ZipCloak object list
 OBJLISTS = zipsplit_objlist.with       # ZipSplit object list
@@ -437,6 +458,13 @@ all: request flush $(ZIPS)
 time_lib$(O):
       $(CC) WITH=$(CFILE) $(CUSEMEM) DEF=ZIP LISTFILE=$>$(LISTEXTZ) OBJNAME=$@ $*.c
 
+# z.library-backed Zip (deflate via zlib API)
+zip_z$(O): zip.c $(ZIP_H) revision.h crypt.h ttyio.h
+      $(CC) WITH=$(CFILE) $(CUSEMEM) $(CDEFZLIB) $(ZINCDIR) LISTFILE=zip$(LISTEXTZ) OBJNAME=$@ zip.c
+
+zipup_z$(O): zipup.c $(ZIP_H) revision.h crypt.h amiga/zipup.h
+      $(CC) WITH=$(CFILE) $(CUSEMEM) $(CDEFZLIB) $(ZINCDIR) LISTFILE=zipup$(LISTEXTZ) OBJNAME=$@ zipup.c
+
 #########################
 # Final output targets. #
 #########################
@@ -449,6 +477,22 @@ zip:      local_zip CommonFlags $(OBJZ)
                 "$(LDFLAGS2) $(LMAPZ)" >$(LWITHZ)
           Type $(LWITHZ)
           $(LD) TO Zip      WITH $(LWITHZ)
+
+zip_staticZ: local_zip CommonFlags $(OBJZZ)
+          @Echo "$(OBJZZ)" > $(OBJLISTZZ)
+          Type $(OBJLISTZZ)
+          @Echo "$(LDFLAGSS) $(LUTIL) WITH $(OBJLISTZZ) $(LIBFLAGS) $(ZLIB_STATIC)" \
+                "$(LDFLAGS2) $(LMAPZ)" >$(LWITHZZS)
+          Type $(LWITHZZS)
+          $(LD) TO zip_staticZ WITH $(LWITHZZS)
+
+zip_lvoZ: local_zip CommonFlags $(OBJZZ)
+          @Echo "$(OBJZZ)" > $(OBJLISTZZ)
+          Type $(OBJLISTZZ)
+          @Echo "$(LDFLAGSS) $(LUTIL) WITH $(OBJLISTZZ) $(LIBFLAGS) $(ZLIB_STUBS)" \
+                "$(LDFLAGS2) $(LMAPZ)" >$(LWITHZZL)
+          Type $(LWITHZZL)
+          $(LD) TO zip_lvoZ WITH $(LWITHZZL)
 
 zipnote:  local_zip CommonFlags $(OBJN)
           @Echo "$(OBJN)" > $(OBJLISTN)
@@ -485,20 +529,21 @@ ziplm:    local_zip CommonFlags $(OBJL)
 
 clean:
         -Delete >nil: $(OBJZ) quiet
+        -Delete >nil: $(OBJZZ) quiet
         -Delete >nil: $(OBJN) quiet
         -Delete >nil: $(OBJC) quiet
         -Delete >nil: $(OBJS) quiet
         -Delete >nil: $(OBJL) quiet
-        -Delete >nil: $(OBJLISTZ) $(OBJLISTL) $(OBJLISTN) $(OBJLISTS) $(OBJLISTC) quiet
+        -Delete >nil: $(OBJLISTZ) $(OBJLISTZZ) $(OBJLISTL) $(OBJLISTN) $(OBJLISTS) $(OBJLISTC) quiet
         -Delete >nil: $(MAPFZ) $(MAPFN) $(MAPFC) $(MAPFS) $(MAPFL) quiet
         -Delete >nil: \#?$(LISTEXTZ) \#?$(LISTEXTU) \#?$(LISTEXTL) quiet
         -Delete >nil: $(CWITHOPT) $(CFILE) quiet
-        -Delete >nil: $(LWITHZ) $(LWITHN) $(LWITHC) $(LWITHS) $(LWITHL) quiet
+        -Delete >nil: $(LWITHZ) $(LWITHZZS) $(LWITHZZL) $(LWITHN) $(LWITHC) $(LWITHS) $(LWITHL) quiet
         -Delete >nil: env:VersionDate quiet
         -Delete >nil: \#?.q.?? \#?.tmp \#?.cov quiet
 
 spotless: clean
-        -Delete >nil: $(ZIPS) quiet
+        -Delete >nil: $(ZIPS) zip_staticZ zip_lvoZ quiet
 
 
 ################
@@ -512,7 +557,9 @@ spotless: clean
 #
 
 zip$(O):        zip.c      $(ZIP_H) revision.h crypt.h ttyio.h
+zip_z$(O):      zip.c      $(ZIP_H) revision.h crypt.h ttyio.h
 zipup$(O):      zipup.c    $(ZIP_H) revision.h crypt.h amiga/zipup.h
+zipup_z$(O):    zipup.c    $(ZIP_H) revision.h crypt.h amiga/zipup.h
 zipfile$(O):    zipfile.c  $(ZIP_H) revision.h
 crypt$(O):      crypt.c    $(ZIP_H) crypt.h ttyio.h
 ttyio$(O):      ttyio.c    $(ZIP_H) crypt.h ttyio.h

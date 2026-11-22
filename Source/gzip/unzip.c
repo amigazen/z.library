@@ -117,7 +117,11 @@ int unzip(in, out)
     /* Decompress */
     if (method == DEFLATED)  {
 
+#ifdef USE_ZLIB
+	int res = gz_zlib_inflate();
+#else
 	int res = inflate();
+#endif
 
 	if (res == 3) {
 	    error("out of memory");
